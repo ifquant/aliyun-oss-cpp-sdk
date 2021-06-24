@@ -29,6 +29,7 @@ set(TARGET_OUTPUT_NAME_PREFIX "alibabacloud-oss-" CACHE STRING "The target's out
 #Options
 option(BUILD_SHARED_LIBS  "Enable shared library" OFF)
 option(BUILD_SAMPLE "Build sample" ON)
+option(BUILD_PERF "Build PERF" ON)
 option(BUILD_TESTS "Build unit and perfermence tests" OFF)
 option(ENABLE_COVERAGE "Flag to enable/disable building code with -fprofile-arcs and -ftest-coverage. Gcc only" OFF)
 option(ENABLE_RTTI "Flag to enable/disable building code with RTTI information" ON)
@@ -100,6 +101,7 @@ endif()
 
 #Compiler flags
 list(APPEND SDK_COMPILER_FLAGS "-std=c++11")
+list(APPEND SDK_COMPILER_FLAGS "-ggdb3")
 if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
 	list(APPEND SDK_COMPILER_FLAGS "/MP")
 	if (NOT ENABLE_RTTI)
@@ -138,6 +140,10 @@ include(ExternalProject)
 include(GNUInstallDirs)
 
 add_subdirectory(sdk)
+
+if(BUILD_PERF)
+add_subdirectory(perf)
+endif()
 
 if(BUILD_SAMPLE)
 	add_subdirectory(sample)
