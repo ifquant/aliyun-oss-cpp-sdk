@@ -35,6 +35,8 @@ struct PCount {
     mutable bool ready;
 };
 
+bool g_sync;
+
 class PutObjectAsyncContex : public AsyncCallerContext
 {
 public:
@@ -102,12 +104,13 @@ std::string get_key(int cidx,int idx) {
 
 
 
-#define TSIZE 16
-#define BSIZE 20480
+#define TSIZE 2048
+#define BSIZE 2048
 std::string d[TSIZE][BSIZE];
 std::mutex g_mtx;
+int g_mill;
 
-std::shared_ptr<std::iostream> g_data[TSIZE][4096];
+std::shared_ptr<std::iostream> g_data[TSIZE][1024];
 
 
 std::string query_md5key(int cidx, int idx) {
@@ -133,33 +136,52 @@ void put_test(std::string bucketname, int startidx, int size)
     pcount.total = size;
     pcount.ready = false;
 
+    /*
     std::shared_ptr<std::iostream> data[4096];
     for (int i = 0; i < 4096; i++) {
         data[i] =GetRandomStream(4096);
-    }
+    }*/
+    ClientConfiguration conf;
+    conf.maxConnections = 16;
+    conf.enableCrc64 = false;
 
 
     std::shared_ptr<OssClient> Client;
-    Client = std::make_shared<OssClient>(Config::Endpoint, Config::AccessKeyId, Config::AccessKeySecret, ClientConfiguration());
+    Client = std::make_shared<OssClient>(Config::Endpoint, Config::AccessKeyId, Config::AccessKeySecret, conf);
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int i=0; i < size; i++) {
         std::string memKey = query_md5key(startidx,i); 
-        auto memContent = g_data[startidx][i % 4096];
-
-        std::shared_ptr<PutObjectAsyncContex> memContext = std::make_shared<PutObjectAsyncContex>(&pcount);
-        memContext->setUuid(memKey);
-        PutObjectAsyncHandler handler = PutObjectHandler;
-        PutObjectRequest memRequest(bucketname, memKey, memContent);
-        Client->PutObjectAsync(memRequest, handler, memContext);
+        auto memContent = g_data[startidx][i % 1024];
+        if (g_sync) {
+            auto pOutcome = Client->PutObject(bucketname, memKey, memContent);
+            if (pOutcome.isSuccess() == true) {
+                pcount.success++;
+            } else {
+                pcount.failed++;
+            }
+            //EXPECT_EQ(pOutcome.isSuccess(), true);
+        } else {
+            std::shared_ptr<PutObjectAsyncContex> memContext = std::make_shared<PutObjectAsyncContex>(&pcount);
+            memContext->setUuid(memKey);
+            PutObjectAsyncHandler handler = PutObjectHandler;
+            PutObjectRequest memRequest(bucketname, memKey, memContent);
+            Client->PutObjectAsync(memRequest, handler, memContext);
+        }
     }
+
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> tm = end - start;	// 毫秒
     {
         std::unique_lock<std::mutex> lck(g_mtx,std::defer_lock);
         lck.lock();
         std::cout << "thread: "<< startidx <<" time spend request: " << tm.count() << "ms" << std::endl;
+        g_mill += tm.count();
         lck.unlock();
+        if (g_sync) {
+            std::cout << "thread: "<< startidx <<" success: " << pcount.success << " failed" << pcount.failed << std::endl;
+            return;
+        }
     }
     //std::cout << "is there a" <<std::endl;
     {
@@ -269,6 +291,8 @@ void get_test(std::string bucketname,int startidx, int size)
     struct PCount pcount;
     pcount.total = size;
     pcount.ready = false;
+    pcount.failed = 0;
+    pcount.success = 0;
 
     std::shared_ptr<OssClient> Client;
     Client = std::make_shared<OssClient>(Config::Endpoint, Config::AccessKeyId, Config::AccessKeySecret, ClientConfiguration());
@@ -280,15 +304,31 @@ void get_test(std::string bucketname,int startidx, int size)
     for (int i=0; i < size; i++) {
         std::string memKey = query_md5key(startidx,i); 
         GetObjectRequest request(bucketname, memKey);
-        std::shared_ptr<GetObjectAsyncContex> memContext = std::make_shared<GetObjectAsyncContex> (&pcount);
-        Client->GetObjectAsync(request, handler, memContext);
+        if (g_sync) {
+              auto outome   = Client->GetObject(bucketname, memKey);
+              //EXPECT_EQ(outome.isSuccess(), true);
+              if (outome.isSuccess() == true) {
+                  pcount.success++;
+              } else {
+                  pcount.failed++;
+              }
+        } else {
+            std::shared_ptr<GetObjectAsyncContex> memContext = std::make_shared<GetObjectAsyncContex> (&pcount);
+            Client->GetObjectAsync(request, handler, memContext);
+        }
     }
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> tm = end - start;	// 毫秒
     {
-        std::unique_lock<std::mutex> lck(g_mtx);
+        std::unique_lock<std::mutex> lck(g_mtx,std::defer_lock);
+        lck.lock();
+        g_mill += tm.count();
         std::cout <<"thread: "<<startidx << " spend time request: " << tm.count() << "ms" << std::endl;
-        lck.release();
+        lck.unlock();
+        if (g_sync) {
+            std::cout << "thread: "<< startidx <<" success: " << pcount.success << " failed" << pcount.failed << std::endl;
+            return;
+        }
     }
 
     {
@@ -300,9 +340,10 @@ void get_test(std::string bucketname,int startidx, int size)
     tm = end - start;	// 毫秒
 	// std::chrono::duration<double, std::micro> tm = end - start; 微秒
     {
-    std::unique_lock<std::mutex> lck(g_mtx);
-    std::cout << "thread: "<<startidx<< " spend time done: " << tm.count() << "ms" << std::endl;
-    lck.release();
+        std::unique_lock<std::mutex> lck(g_mtx,std::defer_lock);
+        lck.lock();
+        std::cout << "thread: "<<startidx<< " spend time done: " << tm.count() << "ms" << std::endl;
+        lck.unlock();
     }
 }
 
@@ -334,7 +375,7 @@ typedef void *(*fn)(void*);
 void perf_run(char *type, int threadnum, int size)
 {
     void *res;
-    tinfo_t tinfo[64];
+    tinfo_t tinfo[TSIZE];
     pthread_attr_t attr;
     fn func;
 
@@ -356,8 +397,9 @@ void perf_run(char *type, int threadnum, int size)
         pthread_join(tinfo[i].thread_id, &res);
         //free(res);
     }
-
+    std::cout << "avg g_mil: "  <<AlibabaCloud::OSS::g_mill / threadnum <<std::endl;
 }
+
 
 int main(int argc, char *argv[]) {
 
@@ -367,6 +409,10 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < 4096; i++) {
         data[i] =GetRandomStream(4096);
     }*/
+
+    AlibabaCloud::OSS::g_sync = true;
+    AlibabaCloud::OSS::g_mill = 0;
+
     AlibabaCloud::OSS::InitializeSdk();
 
 
@@ -380,7 +426,7 @@ int main(int argc, char *argv[]) {
     int threadnum = atoi(argv[2]);
     int size      = atoi(argv[3]);
 
-    int datasize = (4096 > size)?size:4096;
+    int datasize = (1024 > size)?size:1024;
     int tsize = (TSIZE>threadnum)?threadnum:TSIZE;
     for (int i =0; i <tsize; i ++ ) {
         for (int j = 0; j < datasize; j++) {
